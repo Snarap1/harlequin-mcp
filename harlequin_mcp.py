@@ -16,12 +16,14 @@ Exposes the databases configured in your Harlequin profiles (~/.harlequin.toml,
 ./pyproject.toml, etc.) to an MCP client such as Claude Code. It opens its OWN
 read-only-by-default connection using the same profile config Harlequin uses, so
 it can run alongside a live Harlequin TUI session against server databases
-(Postgres / MySQL / SQL Server) without conflict.
+(Postgres / MySQL / SQL Server) without conflict. It is strictly read-only:
+every query is screened and anything that could change data or schema is refused.
 
 Tools:
   - list_profiles()                              -> available profiles + adapter
   - get_schema(profile, name_filter, columns)   -> catalog tree (tables/columns)
-  - run_query(profile, sql, limit, allow_writes) -> rows for a SELECT
+  - run_query(profile, sql, limit)              -> rows for a read-only SELECT
+  - export_query(profile, sql, dest_path, ...)   -> write full result to a file
 
 It reuses Harlequin's own machinery, so no changes to Harlequin are required:
   harlequin.config.load_config / get_config_for_profile  -> read profiles
@@ -31,6 +33,7 @@ It reuses Harlequin's own machinery, so no changes to Harlequin are required:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -54,9 +57,70 @@ _NON_ADAPTER_KEYS = {
     "no_download_tzdata",
 }
 
+# A statement must begin with one of these to even be considered read-only.
 _READ_ONLY_PREFIXES = ("select", "with", "explain", "show", "describe", "desc", "table")
 
+# Any of these keywords appearing anywhere (outside string/comment) means the
+# statement can change data or schema, so it is refused even if it starts with a
+# read-only prefix (e.g. a data-modifying CTE: WITH x AS (DELETE ...) SELECT ...).
+_WRITE_KEYWORDS = frozenset(
+    {
+        "insert", "update", "delete", "drop", "truncate", "alter", "create",
+        "replace", "merge", "upsert", "grant", "revoke", "vacuum", "attach",
+        "detach", "copy", "call", "do", "lock", "rename", "reindex", "refresh",
+        "comment", "into", "nextval", "setval",
+    }
+)
+
+# dest_path extension -> export format. Inferred when `format` is left blank.
+_EXPORT_FORMATS = {
+    ".csv": "csv",
+    ".tsv": "csv",
+    ".parquet": "parquet",
+    ".pq": "parquet",
+    ".json": "json",
+    ".ndjson": "json",
+    ".feather": "feather",
+    ".arrow": "feather",
+    ".orc": "orc",
+}
+
 mcp = FastMCP("harlequin")
+
+
+def _strip_sql(sql: str) -> str:
+    """Remove comments and string/dollar-quoted literals so keyword scanning of the
+    remaining SQL can't be fooled by text inside strings or tripped by it."""
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)  # /* block comments */
+    sql = re.sub(r"--[^\n]*", " ", sql)  # -- line comments
+    sql = re.sub(r"\$\$.*?\$\$", " ", sql, flags=re.S)  # $$ dollar-quoted $$
+    sql = re.sub(r"'(?:[^']|'')*'", " ", sql)  # 'single quoted'
+    sql = re.sub(r'"(?:[^"]|"")*"', " ", sql)  # "quoted identifiers"
+    return sql
+
+
+def _read_only_violation(sql: str) -> str | None:
+    """Return a human-readable reason the SQL is refused, or None if it is read-only.
+
+    Defense in depth: requires a read-only opening keyword, rejects stacked
+    statements, and rejects any data/DDL-changing keyword anywhere in the body.
+    """
+    cleaned = _strip_sql(sql)
+    statements = [s for s in cleaned.split(";") if s.strip()]
+    if len(statements) > 1:
+        return "multiple statements are not allowed; send one read-only query"
+    body = statements[0].strip() if statements else ""
+    if not body:
+        return "empty statement"
+    if not body.lstrip("(").lower().startswith(_READ_ONLY_PREFIXES):
+        return (
+            "statement is not read-only; only SELECT / WITH / EXPLAIN / SHOW / "
+            "DESCRIBE / TABLE queries are allowed"
+        )
+    found = sorted({w for w in re.findall(r"[a-z_]+", body.lower()) if w in _WRITE_KEYWORDS})
+    if found:
+        return f"statement contains write keyword(s): {', '.join(found)}"
+    return None
 
 
 def _build_adapter(profile_name: str | None) -> HarlequinAdapter:
@@ -216,27 +280,129 @@ def get_schema(
 
 
 @mcp.tool()
+def get_columns(
+    profile: str | None = None,
+    path: list[str] | None = None,
+) -> Any:
+    """
+    Return the columns of a single table/view with their real SQL data types and
+    nullability. Cheaper and more precise than get_schema(include_columns=True)
+    when you already know which table you want.
+
+    Args:
+        profile: Profile name. Omit to use the default profile.
+        path: Exact (case-insensitive) names down to the table, top-down, e.g.
+            ["mydb", "public", "orders"] or ["mydb", "orders"]. On a miss,
+            returns the available names at that level.
+
+    Types come from information_schema.columns. If that view is unavailable for
+    the adapter, falls back to the engine's short type labels (e.g. ## / s / ts).
+    """
+    path = path or []
+    if not path:
+        return {"error": "path is required (drill down to a table)."}
+
+    adapter = _build_adapter(profile)
+    conn: HarlequinConnection = adapter.connect()
+    try:
+        catalog: Catalog = conn.get_catalog()
+        nodes: list[CatalogItem] = list(catalog.items)
+        item: CatalogItem | None = None
+        for i, segment in enumerate(path):
+            matches = _match(nodes, segment)
+            if not matches:
+                return {
+                    "error": f"no node named {segment!r} at path {path[:i]}",
+                    "available": sorted(n.label for n in nodes),
+                }
+            if i == len(path) - 1:
+                item = matches[0]
+            else:
+                nodes = [c for m in matches for c in _children(m)]
+        assert item is not None
+
+        table_name = item.label
+        schema_name = path[-2] if len(path) >= 2 else None
+        cols = _columns_from_information_schema(conn, table_name, schema_name)
+        if cols is None:
+            cols = _columns_from_describe(conn, item)
+    finally:
+        getattr(conn, "close", lambda: None)()
+
+    return {"table": item.qualified_identifier, "columns": cols}
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _columns_from_information_schema(
+    conn: HarlequinConnection, table_name: str, schema_name: str | None
+) -> list[dict[str, Any]] | None:
+    """Real column types via information_schema; None if it errors or finds nothing."""
+    where = f"table_name = {_sql_literal(table_name)}"
+    if schema_name:
+        where += f" AND table_schema = {_sql_literal(schema_name)}"
+    sql = (
+        "SELECT column_name, data_type, is_nullable, ordinal_position "
+        f"FROM information_schema.columns WHERE {where} ORDER BY ordinal_position"
+    )
+    try:
+        cursor = conn.execute(sql)
+        if cursor is None:
+            return None
+        names = [n for n, _ in cursor.columns()]
+        rows = _rows(cursor.fetchall(), names)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return [
+        {
+            "name": r[0],
+            "type": r[1],
+            "nullable": str(r[2]).upper() not in {"NO", "0", "FALSE"},
+            "position": r[3],
+        }
+        for r in rows
+    ]
+
+
+def _columns_from_describe(
+    conn: HarlequinConnection, item: CatalogItem
+) -> list[dict[str, Any]]:
+    """Fallback: names + the engine's short type labels via a 0-row select."""
+    cursor = conn.execute(f"SELECT * FROM {item.qualified_identifier}")
+    if cursor is None:
+        return []
+    cursor = cursor.set_limit(0)
+    return [
+        {"name": name, "type": type_label, "position": i + 1}
+        for i, (name, type_label) in enumerate(cursor.columns())
+    ]
+
+
+@mcp.tool()
 def run_query(
     profile: str | None = None,
     sql: str = "",
     limit: int = 50,
-    allow_writes: bool = False,
 ) -> dict[str, Any]:
     """
-    Execute a query against a profile and return rows. Read-only by default.
+    Execute a read-only query against a profile and return rows.
+
+    Only SELECT / WITH / EXPLAIN / SHOW / DESCRIBE / TABLE queries are allowed.
+    Any statement that can modify data or schema (INSERT, UPDATE, DELETE, DROP,
+    TRUNCATE, ALTER, CREATE, ...) is refused — this server is read-only.
 
     Args:
         profile: Profile name. Omit to use the default profile.
         sql: A single SQL statement.
         limit: Max rows returned.
-        allow_writes: Must be True to run a non-SELECT statement.
     """
-    stripped = sql.strip().lstrip("(").lower()
-    if not allow_writes and not stripped.startswith(_READ_ONLY_PREFIXES):
-        return {
-            "error": "Refused: statement is not read-only. "
-            "Pass allow_writes=true to override."
-        }
+    violation = _read_only_violation(sql)
+    if violation:
+        return {"error": f"Refused (read-only server): {violation}."}
 
     adapter = _build_adapter(profile)
     conn = adapter.connect()
@@ -251,6 +417,135 @@ def run_query(
         getattr(conn, "close", lambda: None)()
 
     return {"columns": columns, "rows": _rows(data, columns)}
+
+
+@mcp.tool()
+def export_query(
+    profile: str | None = None,
+    sql: str = "",
+    dest_path: str = "",
+    format: str = "",
+    limit: int = 0,
+) -> dict[str, Any]:
+    """
+    Run a read-only query and write its FULL result set to a file, bypassing the
+    row/size limits of run_query. Use this for large extracts ("dump these rows
+    to parquet/csv") instead of returning data into the conversation.
+
+    Only read-only queries are allowed; any data/schema-changing statement is
+    refused (see run_query).
+
+    Args:
+        profile: Profile name. Omit to use the default profile.
+        sql: A single read-only SQL statement.
+        dest_path: Destination file path. The parent directory must exist; an
+            existing file is overwritten. Tip: write to the session scratchpad
+            for throwaway extracts.
+        format: One of csv, parquet, json, feather, orc. Left blank, it is
+            inferred from the dest_path extension (.csv/.parquet/.json/...).
+        limit: Max rows to write. 0 (default) means no limit — write everything.
+
+    Returns the destination path, format, and the number of rows/columns written.
+    """
+    if not dest_path:
+        return {"error": "dest_path is required."}
+    violation = _read_only_violation(sql)
+    if violation:
+        return {"error": f"Refused (read-only server): {violation}."}
+
+    fmt = format.lower() or _EXPORT_FORMATS.get(_suffix(dest_path), "")
+    if fmt not in {"csv", "parquet", "json", "feather", "orc"}:
+        return {
+            "error": f"Unknown export format {fmt or '(none)'!r}; pass `format` or "
+            "use a known extension (.csv/.parquet/.json/.feather/.orc).",
+        }
+
+    import os
+
+    parent = os.path.dirname(os.path.abspath(os.path.expanduser(dest_path)))
+    if not os.path.isdir(parent):
+        return {"error": f"Parent directory does not exist: {parent}"}
+
+    adapter = _build_adapter(profile)
+    conn = adapter.connect()
+    try:
+        cursor = conn.execute(sql)
+        if cursor is None:
+            return {"error": "Statement returned no result set to export."}
+        if limit > 0:
+            cursor = cursor.set_limit(limit)
+        columns = [name for name, _type in cursor.columns()]
+        data = cursor.fetchall()
+    finally:
+        getattr(conn, "close", lambda: None)()
+
+    table = _arrow_table(data, columns)
+    out = os.path.abspath(os.path.expanduser(dest_path))
+    _write_table(table, out, fmt)
+
+    return {
+        "path": out,
+        "format": fmt,
+        "rows": table.num_rows,
+        "columns": list(table.column_names),
+        "bytes": os.path.getsize(out),
+    }
+
+
+def _suffix(path: str) -> str:
+    import os
+
+    return os.path.splitext(path)[1].lower()
+
+
+def _arrow_table(data: Any, columns: list[str]) -> Any:
+    """Coerce an adapter result into a pyarrow.Table, preserving column order."""
+    import pyarrow as pa
+
+    if data is None:
+        return pa.table({c: [] for c in columns})
+    if isinstance(data, pa.Table):
+        return data.select(columns) if columns else data
+    if isinstance(data, pa.RecordBatch):
+        return pa.Table.from_batches([data])
+    if hasattr(data, "to_pydict"):  # other arrow-like batches
+        cols = data.to_pydict()
+        return pa.table({c: cols[c] for c in columns}) if columns else pa.table(cols)
+    if isinstance(data, dict):  # Mapping[str, Sequence]
+        return pa.table({c: data[c] for c in columns}) if columns else pa.table(data)
+    # Sequence of row iterables -> list of dicts, let Arrow infer types.
+    records = [dict(zip(columns, row)) for row in data]
+    return pa.Table.from_pylist(records)
+
+
+def _write_table(table: Any, dest_path: str, fmt: str) -> None:
+    """Write a pyarrow.Table to dest_path in the requested format."""
+    if fmt == "csv":
+        import pyarrow.csv as pc
+
+        pc.write_csv(table, dest_path)
+    elif fmt == "parquet":
+        import pyarrow.parquet as pq
+
+        pq.write_table(table, dest_path)
+    elif fmt == "feather":
+        import pyarrow.feather as pf
+
+        pf.write_feather(table, dest_path)
+    elif fmt == "orc":
+        import pyarrow.orc as po
+
+        po.write_table(table, dest_path)
+    elif fmt == "json":
+        # JSON array of row objects, written incrementally so we never build one
+        # giant string for large extracts.
+        with open(dest_path, "w", encoding="utf-8") as fh:
+            fh.write("[")
+            for i, record in enumerate(table.to_pylist()):
+                fh.write(("," if i else "") + json.dumps(record, default=str))
+            fh.write("]")
+    else:  # pragma: no cover - guarded by caller
+        raise ValueError(f"unsupported format {fmt!r}")
 
 
 def _rows(data: Any, columns: list[str]) -> list[list[Any]]:

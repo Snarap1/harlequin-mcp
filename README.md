@@ -8,7 +8,9 @@ MCP server that exposes your [Harlequin](https://harlequin.sh) database profiles
 |------|-------------|
 | `list_profiles` | List all configured Harlequin profiles |
 | `get_schema` | Browse catalog (databases → schemas → tables → columns) |
+| `get_columns` | List one table's columns with real SQL types + nullability |
 | `run_query` | Execute SQL (read-only by default) |
+| `export_query` | Run a query and write the full result to a file (csv/parquet/json/feather/orc) |
 
 ## Requirements
 
@@ -125,8 +127,8 @@ list_profiles()
 # Browse all tables in a schema
 get_schema(profile="my_pg", path=["mydb", "public"])
 
-# Get columns for a specific table
-get_schema(profile="my_pg", path=["mydb", "public", "orders"], include_columns=true)
+# Get columns for a specific table, with real SQL types + nullability
+get_columns(profile="my_pg", path=["mydb", "public", "orders"])
 
 # Find tables by partial name
 get_schema(profile="my_pg", name_filter="user")
@@ -134,8 +136,11 @@ get_schema(profile="my_pg", name_filter="user")
 # Run a query
 run_query(profile="my_pg", sql="SELECT * FROM orders WHERE created_at > now() - interval '1 day'", limit=100)
 
-# Write query (requires explicit opt-in)
-run_query(profile="my_pg", sql="DELETE FROM stale_jobs WHERE ...", allow_writes=true)
+# Export a large result set to a file (no row limit; format inferred from extension)
+export_query(profile="my_pg", sql="SELECT * FROM orders", dest_path="/path/to/orders.parquet")
+
+# Force a format regardless of extension
+export_query(profile="my_pg", sql="SELECT * FROM orders", dest_path="/path/to/out", format="csv")
 ```
 
 ## Supported adapters
@@ -171,6 +176,8 @@ brew install unixodbc
 
 ## Notes
 
-- Queries are **read-only by default** — `run_query` rejects any statement not starting with `SELECT`, `WITH`, `EXPLAIN`, `SHOW`, `DESCRIBE`, or `TABLE` unless `allow_writes=true`
+- This server is **strictly read-only** — there is no write override. `run_query` and `export_query` accept only `SELECT` / `WITH` / `EXPLAIN` / `SHOW` / `DESCRIBE` / `TABLE` statements, and additionally refuse any query that contains a data- or schema-changing keyword (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `TRUNCATE`, `ALTER`, `CREATE`, `GRANT`, `COPY`, …), data-modifying CTEs (`WITH … AS (DELETE …)`), `SELECT … INTO`, and multiple stacked statements (`;`)
 - The server opens its own connection per request, so it works alongside a live Harlequin TUI session against the same database
 - `get_schema` caps output at 60 000 chars to stay within MCP limits; use `path` to drill down if you hit the cap
+- `get_columns` reports real SQL types from `information_schema.columns`, falling back to the engine's short type labels (`##`, `s`, `ts`, …) if that view isn't available for the adapter
+- `export_query` bypasses `run_query`'s row/size limits — use it for large extracts. The format is inferred from the `dest_path` extension (`.csv`/`.parquet`/`.json`/`.feather`/`.orc`) or set explicitly via `format`; the parent directory must already exist
